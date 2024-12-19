@@ -1,0 +1,29 @@
+digraph {
+	graph [fontname=Arial, nodesep=0.125, ranksep=0.25];
+	node [fontcolor=white, fontname=Arial, height=0, shape=box, style=filled, width=0];
+	edge [fontname=Arial];
+	1 [color="#fe0800", fontcolor="#ffffff", fontsize="10.00", label="operation_thread(StorageEngine&)\n99.25%\n(22.56%)\n16×"];
+	1 -> 3 [arrowsize="0.64", color="#0ba942", fontcolor="#0ba942", fontsize="10.00", label="41.23%\n3010528441×", labeldistance="1.65", penwidth="1.65"];
+	1 -> 4 [arrowsize="0.48", color="#0c8891", fontcolor="#0c8891", fontsize="10.00", label="23.31%\n1513762229×", labeldistance="0.93", penwidth="0.93"];
+	1 -> 5 [arrowsize="0.35", color="#0d307d", fontcolor="#0d307d", fontsize="10.00", label="7.80%\n1973718007×", labeldistance="0.50", penwidth="0.50"];
+	1 -> 8 [arrowsize="0.35", color="#0d1977", fontcolor="#0d1977", fontsize="10.00", label="2.96%\n1527548607×", labeldistance="0.50", penwidth="0.50"];
+	1 -> 10 [arrowsize="0.35", color="#0d1074", fontcolor="#0d1074", fontsize="10.00", label="0.84%\n1507479117×", labeldistance="0.50", penwidth="0.50"];
+	1 -> 11 [arrowsize="0.35", color="#0d0f73", fontcolor="#0d0f73", fontsize="10.00", label="0.56%\n2280661501×", labeldistance="0.50", penwidth="0.50"];
+	2 [color="#fe0800", fontcolor="#ffffff", fontsize="10.00", label="std::thread::_State_impl<std::thread::_Invoker<std::tuple<void (*)(StorageEngine&), std::reference_wrapper<StorageEngine> > > >::_M_run()\n99.25%\n(0.00%)"];
+	2 -> 1 [arrowsize="1.00", color="#fe0800", fontcolor="#fe0800", fontsize="10.00", label="99.25%\n16×", labeldistance="3.97", penwidth="3.97"];
+	3 [color="#66c708", fontcolor="#ffffff", fontsize="10.00", label="frame_dummy\n62.28%\n(62.28%)\n4547629984×"];
+	3 -> 3 [arrowsize="0.79", color="#66c708", fontcolor="#66c708", fontsize="10.00", label="3×", labeldistance="2.49", penwidth="2.49"];
+	4 [color="#0c8891", fontcolor="#ffffff", fontsize="10.00", label="std::__detail::_Map_base<int, std::pair<int const, std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > >, std::allocator<std::pair<int const, std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > > >, std::__detail::_Select1st, std::equal_to<int>, std::hash<int>, std::__detail::_Mod_range_hashing, std::__detail::_Default_ranged_hash, std::__detail::_Prime_rehash_policy, std::__detail::_Hashtable_traits<false, false, true>, true>::operator[](int const&)\n23.31%\n(0.87%)\n1513762329×"];
+	4 -> 3 [arrowsize="0.46", color="#0c798e", fontcolor="#0c798e", fontsize="10.00", label="20.91%\n1527097614×", labeldistance="0.84", penwidth="0.84"];
+	4 -> 9 [arrowsize="0.35", color="#0d1375", fontcolor="#0d1375", fontsize="10.00", label="1.53%\n759916092×", labeldistance="0.50", penwidth="0.50"];
+	5 [color="#0d307d", fontcolor="#ffffff", fontsize="10.00", label="stats_thread()\n7.80%\n(1.73%)\n1973718008×"];
+	5 -> 6 [arrowsize="0.35", color="#0d277b", fontcolor="#0d277b", fontsize="10.00", label="6.07%\n2050150440×", labeldistance="0.50", penwidth="0.50"];
+	6 [color="#0d277b", fontcolor="#ffffff", fontsize="10.00", label="std::mersenne_twister_engine<unsigned long, 32ul, 624ul, 397ul, 31ul, 2567483615ul, 11ul, 4294967295ul, 7ul, 2636928640ul, 15ul, 4022730752ul, 18ul, 1812433253ul>::operator()()\n6.07%\n(2.44%)\n2050150440×"];
+	6 -> 7 [arrowsize="0.35", color="#0d1c77", fontcolor="#0d1c77", fontsize="10.00", label="3.64%\n22029412×", labeldistance="0.50", penwidth="0.50"];
+	7 [color="#0d1c77", fontcolor="#ffffff", fontsize="10.00", label="std::mersenne_twister_engine<unsigned long, 32ul, 624ul, 397ul, 31ul, 2567483615ul, 11ul, 4294967295ul, 7ul, 2636928640ul, 15ul, 4022730752ul, 18ul, 1812433253ul>::_M_gen_rand()\n3.64%\n(3.64%)\n22029412×"];
+	8 [color="#0d1977", fontcolor="#ffffff", fontsize="10.00", label="std::__cxx11::to_string(int)\n2.96%\n(2.96%)\n1527548607×"];
+	9 [color="#0d1375", fontcolor="#ffffff", fontsize="10.00", label="std::_Hashtable<int, std::pair<int const, std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > >, std::allocator<std::pair<int const, std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > > >, std::__detail::_Select1st, std::equal_to<int>, std::hash<int>, std::__detail::_Mod_range_hashing, std::__detail::_Default_ranged_hash, std::__detail::_Prime_rehash_policy, std::__detail::_Hashtable_traits<false, false, true> >::_M_insert_unique_node(unsigned long, unsigned long, std::__detail::_Hash_node<std::pair<int const, std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > >, false>*, unsigned long)\n1.53%\n(1.43%)\n759916092×"];
+	10 [color="#0d1074", fontcolor="#ffffff", fontsize="10.00", label="std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> >::_M_replace(unsigned long, unsigned long, char const*, unsigned long)\n0.84%\n(0.84%)\n1507479117×"];
+	11 [color="#0d0f73", fontcolor="#ffffff", fontsize="10.00", label="std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> >::_M_assign(std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > const&)\n0.56%\n(0.56%)\n2280661601×"];
+	12 [color="#0d0f73", fontcolor="#ffffff", fontsize="10.00", label="_init\n0.54%\n(0.54%)"];
+}
