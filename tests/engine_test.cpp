@@ -4,36 +4,30 @@
 #include <chrono>
 #include <thread>
 #include <filesystem>
-
-static const std::string TEST_DB_FILE = "data/test_db.dat";
-static const std::string TEST_DB_IDX_FILE = "data/test_db.dat.idx";
+#include <cstdlib>
+#include <unistd.h>
 
 class EngineTest : public ::testing::Test
 {
 protected:
+    std::filesystem::path directory;
+    std::string db_path;
+
     void SetUp() override
     {
-        // 清理测试用文件
-        if (std::filesystem::exists(TEST_DB_FILE))
-        {
-            std::filesystem::remove(TEST_DB_FILE);
-        }
-        if (std::filesystem::exists(TEST_DB_IDX_FILE))
-        {
-            std::filesystem::remove(TEST_DB_IDX_FILE);
-        }
+        std::string pattern = (std::filesystem::temp_directory_path() / "kv-engine-XXXXXX").string();
+        ASSERT_NE(::mkdtemp(pattern.data()), nullptr);
+        directory = pattern;
+        db_path = (directory / "store.dat").string();
     }
 
     void TearDown() override
     {
-        // 测试结束后清理
-        if (std::filesystem::exists(TEST_DB_FILE))
+        if (!directory.empty())
         {
-            std::filesystem::remove(TEST_DB_FILE);
-        }
-        if (std::filesystem::exists(TEST_DB_IDX_FILE))
-        {
-            std::filesystem::remove(TEST_DB_IDX_FILE);
+            std::error_code error;
+            std::filesystem::remove_all(directory, error);
+            EXPECT_FALSE(error) << error.message();
         }
     }
 };
@@ -41,7 +35,7 @@ protected:
 // 基本同步PUT/GET测试
 TEST_F(EngineTest, BasicPutGet)
 {
-    StorageEngine engine(TEST_DB_FILE, 4, 100, 8);
+    StorageEngine engine(db_path, 4, 100, 8);
     bool result = engine.put(1, "hello");
     EXPECT_TRUE(result);
 
@@ -60,7 +54,7 @@ TEST_F(EngineTest, BasicPutGet)
 // 测试DELETE
 TEST_F(EngineTest, BasicDelete)
 {
-    StorageEngine engine(TEST_DB_FILE, 4, 100, 8);
+    StorageEngine engine(db_path, 4, 100, 8);
     engine.put(2, "test");
     std::string val = engine.get(2);
     EXPECT_EQ(val, "test");
@@ -74,7 +68,7 @@ TEST_F(EngineTest, BasicDelete)
 // 测试缓存命中
 TEST_F(EngineTest, CacheHit)
 {
-    StorageEngine engine(TEST_DB_FILE, 4, 16, 4);
+    StorageEngine engine(db_path, 4, 16, 4);
 
     // 首次put并get，必然访问文件
     engine.put(100, "cache_value");
@@ -95,7 +89,7 @@ TEST_F(EngineTest, CacheHit)
 // LRU缓存淘汰行为测试
 TEST_F(EngineTest, LRUBehavior)
 {
-    StorageEngine engine(TEST_DB_FILE, 4, 3, 1); // 线程池大小4，缓存容量3，缓存段数1
+    StorageEngine engine(db_path, 4, 3, 1); // 线程池大小4，缓存容量3，缓存段数1
 
     // 初始读取计数
     size_t initial_reads = engine.getFileStoreReadCount();
@@ -149,7 +143,7 @@ TEST_F(EngineTest, LRUBehavior)
 // 测试异步操作（asyncPut/asyncGet/asyncDel）
 TEST_F(EngineTest, AsyncOperations)
 {
-    StorageEngine engine(TEST_DB_FILE, 4, 100, 8);
+    StorageEngine engine(db_path, 4, 100, 8);
 
     std::atomic<bool> put_done{false};
     std::atomic<bool> get_done{false};
@@ -194,7 +188,7 @@ TEST_F(EngineTest, AsyncOperations)
 // 测试GC逻辑
 TEST_F(EngineTest, GarbageCollectTest)
 {
-    StorageEngine engine(TEST_DB_FILE, 4, 100, 8);
+    StorageEngine engine(db_path, 4, 100, 8);
 
     // 插入多条记录
     for (int i = 0; i < 20; ++i)
@@ -229,7 +223,7 @@ TEST_F(EngineTest, GarbageCollectTest)
 // 简单并发测试
 TEST_F(EngineTest, ConcurrentAccess)
 {
-    StorageEngine engine(TEST_DB_FILE, 8, 100, 16); // 增加缓存段数
+    StorageEngine engine(db_path, 8, 100, 16); // 增加缓存段数
 
     const int N = 1000;
     std::atomic<int> completed_puts{0};

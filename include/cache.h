@@ -1,46 +1,47 @@
 #ifndef CACHE_H
 #define CACHE_H
 
-#include <unordered_map>
+#include <cstddef>
+#include <cstdint>
 #include <list>
-#include <mutex>
-#include <vector>
 #include <memory>
+#include <mutex>
+#include <string>
+#include <unordered_map>
+#include <vector>
 
-// 单个缓存段，使用LRU策略
 class LRUCacheSegment
 {
 public:
-    LRUCacheSegment(size_t capacity);
-    ~LRUCacheSegment() = default;
-
-    bool get(int key, std::string &value);
-    void put(int key, const std::string &value);
+    explicit LRUCacheSegment(std::size_t capacity);
+    bool get(int key, std::string &value, std::uint64_t *version = nullptr);
+    void put(int key, const std::string &value, std::uint64_t version = 0);
     void remove(int key);
 
 private:
-    size_t capacity_;
-    std::list<std::pair<int, std::string>> cache_list_;
-    std::unordered_map<int, std::list<std::pair<int, std::string>>::iterator> cache_map_;
-    std::mutex mtx_;
+    struct Entry {
+        int key;
+        std::string value;
+        std::uint64_t version;
+    };
+
+    std::size_t capacity_;
+    std::list<Entry> entries_;
+    std::unordered_map<int, std::list<Entry>::iterator> positions_;
+    std::mutex mutex_;
 };
 
-// 分段缓存
 class LRUCache
 {
 public:
-    LRUCache(size_t capacity, size_t num_segments);
-    ~LRUCache() = default;
-
-    bool get(int key, std::string &value);
-    void put(int key, const std::string &value);
+    LRUCache(std::size_t capacity, std::size_t num_segments);
+    bool get(int key, std::string &value, std::uint64_t *version = nullptr);
+    void put(int key, const std::string &value, std::uint64_t version = 0);
     void remove(int key);
 
 private:
-    size_t num_segments_;
     std::vector<std::unique_ptr<LRUCacheSegment>> segments_;
-
-    size_t getSegmentIndex(int key);
+    LRUCacheSegment &segmentFor(int key);
 };
 
-#endif // CACHE_H
+#endif

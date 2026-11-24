@@ -1,11 +1,18 @@
 #ifndef ENGINE_H
 #define ENGINE_H
 
-#include "file_store.h"
-#include "thread_pool.h"
 #include "cache.h"
-#include <string>
+#include "file_store.h"
+#include "kv_types.h"
+#include "thread_pool.h"
+
+#include <condition_variable>
 #include <functional>
+#include <list>
+#include <mutex>
+#include <shared_mutex>
+#include <string>
+#include <vector>
 
 #ifdef _WIN32
 #ifdef BUILD_DLL
@@ -20,31 +27,54 @@
 class EXPORT StorageEngine
 {
 public:
-  StorageEngine(const std::string &storage_file, size_t thread_pool_size = 4, size_t cache_capacity = 100, size_t cache_num_segments = 8);
-  ~StorageEngine();
-  void stop(); // 用于停止接受新任务
+    StorageEngine(const std::string &storage_file, std::size_t thread_pool_size = 4,
+                  std::size_t cache_capacity = 100, std::size_t cache_num_segments = 8,
+                  CommitOptions options = {});
+    ~StorageEngine();
 
-  // 提供公共的垃圾回收接口
-  void garbageCollect();
+    ReadResult read(int key);
+    std::vector<ReadResult> multiGet(const std::vector<int> &keys);
+    Status putIfVersion(int key, std::uint64_t expected_version, const std::string &value);
+    Status writeBatch(const std::vector<Mutation> &mutations);
+    CommitStats commitStats() const;
 
-  // 异步接口
-  void asyncPut(int key, const std::string &value, std::function<void(bool)> callback);
-  void asyncGet(int key, std::function<void(std::string)> callback);
-  void asyncDel(int key, std::function<void(bool)> callback);
+    bool put(int key, const std::string &value);
+    std::string get(int key);
+    bool del(int key);
+    void garbageCollect();
+    std::size_t getFileStoreReadCount() const;
 
-  // 辅助方法，用于处理缓存逻辑
-  bool put(int key, const std::string &value);
-  std::string get(int key);
-  bool del(int key);
-
-  // 获取 FileStore 的读取计数
-  size_t getFileStoreReadCount() const;
+    void stop();
+    void asyncPut(int key, const std::string &value, std::function<void(bool)> callback);
+    void asyncGet(int key, std::function<void(std::string)> callback);
+    void asyncDel(int key, std::function<void(bool)> callback);
 
 private:
-  std::atomic<bool> stopped_{false};
-  ThreadPool thread_pool_;                // 线程池
-  std::unique_ptr<FileStore> file_store_; // 文件存储
-  LRUCache cache_;                        // 缓存
+    enum class Check { None, ExpectedVersion, Exists };
+    struct CommitRequest;
+
+    Status commit(const std::vector<Mutation> &mutations, Check check = Check::None,
+                  std::uint64_t expected_version = 0);
+    void commitGroup(const std::list<CommitRequest *> &group);
+    Status appendRequest(CommitRequest &request);
+    ReadResult readLocked(int key);
+
+    const CommitOptions options_;
+    FileStore file_store_;
+    LRUCache cache_;
+
+    // One read lock spans a full multiGet. One write lock spans append, sync and cache publication.
+    mutable std::shared_mutex state_mutex_;
+    CommitStats stats_;
+    bool unavailable_ = false;
+
+    // Writers can queue while a different group is syncing its records.
+    std::mutex queue_mutex_;
+    std::condition_variable group_full_;
+    std::list<CommitRequest *> waiting_;
+    bool leader_active_ = false;
+
+    ThreadPool thread_pool_;
 };
 
-#endif // ENGINE_H
+#endif

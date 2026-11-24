@@ -1,326 +1,375 @@
 #include "file_store.h"
-#include <iostream>
-#include <cstring>
+#include "store_log.h"
+#include <algorithm>
+#include <cerrno>
 #include <chrono>
-#include <thread>
+#include <filesystem>
+#include <iostream>
+#include <limits>
+#include <stdexcept>
+#include <unordered_set>
+#include <fcntl.h>
+#include <sys/stat.h>
+#include <unistd.h>
 
-// 索引文件存储路径
-#define INDEX_FILE_SUFFIX ".idx"
+using namespace store_log;
+
+namespace {
+std::string readBytes(int fd, U64 offset, U64 length) {
+    require(length <= std::string().max_size(), "record exceeds addressable memory");
+    std::string data(static_cast<std::size_t>(length), '\0');
+    readAt(fd, offset, data.data(), data.size());
+    return data;
+}
+
+void writeFrame(int fd, U64 offset, U64 version, U32 count, const std::string &body) {
+    writeAt(fd, offset, frameHeader(version, count, body));
+    writeAt(fd, offset + frame_header_size, body);
+}
+
+void confirmPath(int fd, const std::string &path) {
+    struct stat opened{}, named{};
+    if (::fstat(fd, &opened) < 0 || ::stat(path.c_str(), &named) < 0) ioError("stat database path");
+    require(opened.st_dev == named.st_dev && opened.st_ino == named.st_ino,
+            "database changed while opening; retry open");
+}
+
+void rejectLegacyIndex(const std::string &path) {
+    auto index = std::filesystem::symlink_status(path + ".idx");
+    require(!std::filesystem::exists(index), "legacy .idx present; use migrateLegacy for the v1 data/index pair");
+}
+
+int openDatabase(const std::string &path, bool clean_start) {
+    int fd = ::open(path.c_str(), O_RDWR | O_CLOEXEC);
+    if (fd >= 0 || errno != ENOENT) return fd;
+
+    // Publish a complete initial header. A crash during creation can never leave
+    // a half-initialized file at the public database path.
+    TempFile initial(path);
+    writeAt(initial.fd.get(), 0, fileHeader(0, 0));
+    syncFile(initial.fd.get());
+    if (!clean_start) rejectLegacyIndex(path);
+    if (::link(initial.path.c_str(), path.c_str()) < 0 && errno != EEXIST)
+        ioError("publish new database");
+    if (::unlink(initial.path.c_str()) == 0) initial.path.clear();
+    return ::open(path.c_str(), O_RDWR | O_CLOEXEC);
+}
+} // namespace
 
 FileStore::FileStore(const std::string &file_path, bool clean_start)
-    : file_path_(file_path), file_size_(0), stop_gc_thread_(false), read_count_(0)
-{
-    if (clean_start)
-    {
-        if (std::ifstream(file_path_))
-        {
-            std::remove(file_path_.c_str());
-        }
-        std::string index_file_path = file_path_ + INDEX_FILE_SUFFIX;
-        if (std::ifstream(index_file_path))
-        {
-            std::remove(index_file_path.c_str());
-        }
+    : path_(std::filesystem::weakly_canonical(std::filesystem::absolute(file_path)).string()) {
+    Descriptor file(openDatabase(path_, clean_start));
+    lockFile(file.get());
+    confirmPath(file.get(), path_);
+    fd_ = file.get();
+    if (clean_start) {
+        std::filesystem::remove(path_ + ".idx");
+        truncateFile(fd_, 0);
+    } else {
+        rejectLegacyIndex(path_);
     }
-
-    // 若数据文件不存在则创建空文件
-    if (!std::ifstream(file_path_))
-    {
-        std::ofstream create_file(file_path_, std::ios::binary);
-        create_file.close();
+    if (!fileSize(fd_)) {
+        writeAt(fd_, 0, fileHeader(0, 0));
+        syncFile(fd_);
     }
-
-    {
-        std::lock_guard<std::mutex> lock(file_mtx_);
-        file_.open(file_path_, std::ios::in | std::ios::out | std::ios::binary);
-        if (!file_)
-        {
-            std::cerr << "Failed to open data file: " << file_path_ << std::endl;
-        }
-    }
-
-    // 加载索引
-    loadIndex();
-
-    // 启动GC线程
-    startGCThread();
+    recover();
+    // Another creator may have died after publishing the name but before syncing it.
+    syncParent(path_);
+    gc_thread_ = std::thread(&FileStore::runGC, this);
+    file.release();
 }
 
-FileStore::~FileStore()
-{
-    stop_gc_thread_ = true; // 停止垃圾回收线程
-
-    if (gc_thread_.joinable())
+FileStore::~FileStore() {
     {
-        gc_thread_.join(); // 等待线程退出
+        std::lock_guard guard(gc_mutex_);
+        stopping_ = true;
     }
-
-    if (file_.is_open())
-    {
-        file_.close();
-    }
-
-    saveIndex();
+    gc_wakeup_.notify_one();
+    gc_thread_.join();
+    ::close(fd_);
 }
 
-// 启动垃圾回收后台线程
-void FileStore::startGCThread()
-{
-    if (gc_thread_.joinable())
-    {
-        return; // 如果线程已经启动，则直接返回
-    }
-
-    gc_thread_ = std::thread([this]()
-                             {
-        while (!stop_gc_thread_) {
-            std::this_thread::sleep_for(std::chrono::hours(2));
+void FileStore::runGC() {
+    std::unique_lock guard(gc_mutex_);
+    while (!gc_wakeup_.wait_for(guard, std::chrono::hours(2), [this] { return stopping_; })) {
+        guard.unlock();
+        try {
             garbageCollect();
-        } });
-}
-
-size_t FileStore::getReadCount() const
-{
-    return read_count_;
-}
-
-// 同步方法 put
-bool FileStore::put(int key, const std::string &value)
-{
-    // 直接使用独占锁
-    std::unique_lock<std::shared_mutex> index_lock(index_mtx_);
-
-    // 写入文件数据
-    size_t offset;
-    {
-        std::lock_guard<std::mutex> file_lock(file_mtx_);
-        offset = file_size_;
-        file_.seekp(file_size_, std::ios::beg);
-        file_.write(value.c_str(), value.size());
-        if (!file_)
-        {
-            std::cerr << "Failed to write to file." << std::endl;
-            return false;
+        } catch (const std::exception &error) {
+            std::cerr << "background compaction: " << error.what() << '\n';
         }
-        file_.flush();
-        file_size_ += value.size();
+        guard.lock();
     }
-
-    // 更新索引
-    index_[key] = ObjectMeta{key, offset, value.size(), false};
-
-    return true;
 }
 
-// 同步方法 get
-std::string FileStore::get(int key)
-{
-    // 查找索引
-    std::shared_lock<std::shared_mutex> index_lock(index_mtx_);
-    auto it = index_.find(key);
-    if (it == index_.end() || it->second.deleted)
-    {
-        return ""; // Key 未找到或已被删除
-    }
-
-    const ObjectMeta &meta = it->second;
-
-    // 从文件读取数据
-    std::string value;
-    value.resize(meta.size);
-    {
-        std::lock_guard<std::mutex> file_lock(file_mtx_);
-        file_.seekg(meta.offset, std::ios::beg);
-        file_.read(&value[0], meta.size);
-        if (!file_)
-        {
-            std::cerr << "Failed to read from file." << std::endl;
-            return "";
+void FileStore::recover() {
+    const U64 size = fileSize(fd_);
+    auto header = readBytes(fd_, 0, std::min<U64>(file_header_size, size));
+    verifyFileHeader(header);
+    version_ = little(header, 8, 8);
+    U64 snapshots = little(header, 16, 8);
+    require(!snapshots || version_, "invalid snapshot high-water mark");
+    end_ = file_header_size;
+    while (end_ < size) {
+        U64 remaining = size - end_;
+        auto bytes = readBytes(fd_, end_, std::min<U64>(frame_header_size, remaining));
+        if (bytes.size() < frame_header_size) {
+            auto prefix = std::string_view(bytes).substr(0, frame_magic.size());
+            require(frame_magic.starts_with(prefix), "invalid trailing frame magic");
+            break; // A partial final header is the only frame without a verifiable length.
         }
-        read_count_++;
-    }
+        auto frame = parseFrameHeader(bytes);
+        bool snapshot = snapshots != 0;
+        if (snapshot) {
+            require(frame.operations == 1 && frame.version <= version_, "invalid snapshot record");
+        } else {
+            require(version_ != std::numeric_limits<U64>::max() && frame.version == version_ + 1,
+                    "invalid batch version sequence");
+        }
+        if (frame.length > remaining - frame_header_size) break;
+        auto body = readBytes(fd_, end_ + frame_header_size, frame.length);
+        require(checksum(body) == frame.body_crc, "batch payload checksum mismatch");
 
+        std::size_t pos = 0;
+        for (U32 i = 0; i < frame.operations; ++i) {
+            require(body.size() - pos >= operation_header_size, "truncated operation in complete batch");
+            char type = body[pos];
+            int key = keyAt(body, pos + 1);
+            U64 length = little(body, pos + 5, 8);
+            pos += operation_header_size;
+            require(length <= body.size() - pos, "invalid value length in complete batch");
+            if (type == 1) {
+                require(!snapshot || !index_.contains(key), "duplicate snapshot key");
+                auto value = std::string_view(body).substr(pos, static_cast<std::size_t>(length));
+                index_[key] = {end_ + frame_header_size + pos, length, frame.version, checksum(value)};
+            } else {
+                require(type == 2 && !length && !snapshot, "invalid deletion in database");
+                index_.erase(key);
+            }
+            pos += static_cast<std::size_t>(length);
+        }
+        require(pos == body.size(), "extra bytes in complete batch");
+        if (snapshot) --snapshots;
+        else version_ = frame.version;
+        end_ += frame_header_size + frame.length;
+    }
+    // An interrupted compaction is never published. A short checkpoint is corruption.
+    require(snapshots == 0, "incomplete database snapshot");
+    if (end_ < size) {
+        truncateFile(fd_, end_);
+        syncFile(fd_);
+    }
+}
+
+std::string FileStore::readValue(const Entry &entry) const {
+    auto value = readBytes(fd_, entry.offset, entry.length);
+    require(checksum(value) == entry.checksum, "stored value checksum mismatch");
     return value;
 }
 
-// 同步方法 del
-bool FileStore::del(int key)
-{
-    // 从索引中查找
-    std::unique_lock<std::shared_mutex> index_lock(index_mtx_);
+ReadResult FileStore::read(int key) {
+    std::lock_guard guard(mutex_);
+    if (!healthy_) return {Status::IOError, {}, 0};
     auto it = index_.find(key);
-    if (it == index_.end() || it->second.deleted)
-    {
-        return false; // Key 未找到或已被删除
+    if (it == index_.end()) return {Status::NotFound, {}, 0};
+    try {
+        auto value = readValue(it->second);
+        ++read_count_;
+        return {Status::Ok, std::move(value), it->second.version};
+    } catch (const std::runtime_error &) {
+        healthy_ = false;
+        return {Status::IOError, {}, 0};
     }
-
-    // 标记为已删除
-    it->second.deleted = true;
-
-    return true;
 }
 
-// 定期清理无效数据
-void FileStore::garbageCollect()
-{
-    // std::cerr << "Start garbageCollect...." << std::endl;
-    // printFileContext();
+std::uint64_t FileStore::versionOf(int key) {
+    std::lock_guard guard(mutex_);
+    auto it = index_.find(key);
+    return it == index_.end() ? 0 : it->second.version;
+}
 
-    // 获取独占锁，防止其他操作
-    std::unique_lock<std::shared_mutex>
-        lock(index_mtx_);
+Status FileStore::appendLocked(const std::vector<Mutation> &mutations, U64 &committed_version) {
+    committed_version = 0;
+    if (!healthy_) return Status::IOError;
+    if (mutations.empty()) return Status::Ok;
+    if (mutations.size() > std::numeric_limits<U32>::max() || version_ == std::numeric_limits<U64>::max())
+        return Status::InvalidArgument;
 
-    std::vector<ObjectMeta> live_objects;
-
-    // 遍历索引表，保留没有被删除的对象
-    for (auto &entry : index_)
-    {
-        const ObjectMeta &meta = entry.second;
-        if (!meta.deleted)
-        {
-            live_objects.push_back(meta);
+    const U64 next = version_ + 1;
+    std::string body;
+    Index changes;
+    for (const auto &item : mutations) {
+        bool put = item.kind == Mutation::Kind::Put;
+        if (!put && (item.kind != Mutation::Kind::Delete || !item.value.empty())) return Status::InvalidArgument;
+        auto position = body.size();
+        addOperation(body, put, item.key, item.value);
+        changes[item.key] = {end_ + frame_header_size + position + operation_header_size,
+                             item.value.size(), put ? next : 0, checksum(item.value)};
+    }
+    // Preallocate index nodes and buckets before persisting any part of the frame.
+    // Node transfer after the write can then publish every key without allocating.
+    if (index_.empty() || index_.size() + changes.size() > index_.bucket_count())
+        index_.reserve(std::max(index_.size() * 2, index_.size() + changes.size()));
+    try {
+        writeFrame(fd_, end_, next, static_cast<U32>(mutations.size()), body);
+    } catch (const std::runtime_error &) {
+        try {
+            truncateFile(fd_, end_);
+            syncFile(fd_);
+        } catch (const std::runtime_error &) {
+            healthy_ = false;
         }
+        return Status::IOError;
     }
-
-    // 压缩文件，只保留有效对象
-    compactFile(live_objects);
-
-    // std::cerr << "After garbageCollect...." << std::endl;
-    // printFileContext();
+    while (!changes.empty()) {
+        auto node = changes.extract(changes.begin());
+        index_.erase(node.key());
+        if (node.mapped().version) index_.insert(std::move(node));
+    }
+    end_ += frame_header_size + body.size();
+    version_ = committed_version = next;
+    return Status::Ok;
 }
 
-// 压缩文件，移除已删除对象的存储
-void FileStore::compactFile(const std::vector<ObjectMeta> &live_objects)
-{
-    std::lock_guard<std::mutex> lock(file_mtx_);
-
-    std::fstream temp_file(file_path_ + ".tmp", std::ios::out | std::ios::binary);
-    if (!temp_file)
-    {
-        std::cerr << "Failed to create temporary file for compacting." << std::endl;
-        return;
-    }
-
-    size_t new_offset = 0;
-    std::unordered_map<int, ObjectMeta> new_index;
-
-    // 将有效数据写入新的文件
-    for (const auto &meta : live_objects)
-    {
-        std::string data;
-        data.resize(meta.size);
-
-        // 读取旧文件中的有效数据
-        file_.seekg(meta.offset, std::ios::beg);
-        file_.read(&data[0], meta.size);
-
-        // 将数据写入新文件
-        temp_file.write(data.c_str(), data.size());
-
-        // 更新索引
-        ObjectMeta new_meta = meta;
-        new_meta.offset = new_offset; // 更新偏移量
-
-        new_index[meta.key] = new_meta;
-        new_offset += data.size();
-    }
-
-    // 关闭临时文件
-    temp_file.close();
-
-    // 替换原文件
-    file_.close();
-    std::rename((file_path_ + ".tmp").c_str(), file_path_.c_str());
-
-    // 重新打开file_：
-    file_.open(file_path_, std::ios::in | std::ios::out | std::ios::binary);
-    if (!file_.is_open())
-    {
-        std::cerr << "Failed to reopen data file after compaction." << std::endl;
-    }
-
-    // 更新索引
-    index_ = std::move(new_index);
-    file_size_ = new_offset; // 更新文件大小
+Status FileStore::appendBatch(const std::vector<Mutation> &mutations, U64 &committed_version) {
+    std::lock_guard guard(mutex_);
+    return appendLocked(mutations, committed_version);
 }
 
-void FileStore::loadIndex()
-{
-    std::string index_file_path = file_path_ + INDEX_FILE_SUFFIX;
-    std::ifstream index_file(index_file_path, std::ios::in | std::ios::binary);
-
-    if (!index_file)
-    {
-        std::cerr << "No existing index file found. Starting fresh." << std::endl;
-        return; // 如果没有索引文件，启动时不会加载任何元数据
+Status FileStore::sync() {
+    std::lock_guard guard(mutex_);
+    if (!healthy_) return Status::IOError;
+    try {
+        syncFile(fd_);
+        return Status::Ok;
+    } catch (const std::runtime_error &) {
+        healthy_ = false;
+        return Status::IOError;
     }
+}
 
-    // 从索引文件中读取所有元数据
-    size_t index_size;
-    index_file.read(reinterpret_cast<char *>(&index_size), sizeof(index_size));
+bool FileStore::healthy() const {
+    return healthy_.load();
+}
 
-    for (size_t i = 0; i < index_size; ++i)
-    {
-        ObjectMeta meta;
-        index_file.read(reinterpret_cast<char *>(&meta), sizeof(ObjectMeta));
-        index_[meta.key] = meta;
-    }
+std::size_t FileStore::getReadCount() const {
+    return read_count_.load();
+}
 
-    // 计算文件大小：遍历索引，找出最大的偏移量 + 对应的大小
-    file_size_ = 0;
-    for (const auto &pair : index_)
-    {
-        const ObjectMeta &meta = pair.second;
-        size_t end_position = meta.offset + meta.size;
-        if (end_position > file_size_)
-        {
-            file_size_ = end_position;
+bool FileStore::put(int key, const std::string &value) {
+    U64 version;
+    return appendBatch({Mutation::put(key, value)}, version) == Status::Ok;
+}
+
+std::string FileStore::get(int key) {
+    return read(key).value;
+}
+
+bool FileStore::del(int key) {
+    std::lock_guard guard(mutex_);
+    U64 version;
+    return index_.contains(key) && appendLocked({Mutation::del(key)}, version) == Status::Ok;
+}
+
+void FileStore::garbageCollect() {
+    std::lock_guard guard(mutex_);
+    require(healthy_, "cannot compact a database with an I/O error");
+    TempFile replacement(path_);
+    lockFile(replacement.fd.get());
+    // Preserve permissions when the new inode takes over the old path.
+    struct stat info{};
+    if (::fstat(fd_, &info) < 0 || ::fchmod(replacement.fd.get(), info.st_mode & 0777) < 0)
+        ioError("copy database permissions");
+    writeAt(replacement.fd.get(), 0, fileHeader(version_, index_.size()));
+    U64 offset = file_header_size;
+    Index updated;
+    updated.reserve(index_.size());
+    for (const auto &[key, entry] : index_) {
+        std::string value;
+        try {
+            value = readValue(entry);
+        } catch (const std::runtime_error &) {
+            healthy_ = false;
+            throw;
         }
+        std::string body;
+        addOperation(body, true, key, value);
+        writeFrame(replacement.fd.get(), offset, entry.version, 1, body);
+        updated[key] = {offset + frame_header_size + operation_header_size, entry.length, entry.version, entry.checksum};
+        offset += frame_header_size + body.size();
     }
-
-    index_file.close();
+    syncFile(replacement.fd.get());
+    if (::rename(replacement.path.c_str(), path_.c_str()) < 0) ioError("publish compacted database");
+    replacement.path.clear();
+    int previous_fd = fd_;
+    fd_ = replacement.fd.release();
+    end_ = offset;
+    index_.swap(updated);
+    ::close(previous_fd);
+    try {
+        syncParent(path_);
+    } catch (...) {
+        healthy_ = false;
+        throw;
+    }
 }
 
-void FileStore::saveIndex()
-{
-    std::string index_file_path = file_path_ + INDEX_FILE_SUFFIX;
-    std::ofstream index_file(index_file_path, std::ios::out | std::ios::binary);
-
-    if (!index_file)
+void FileStore::migrateLegacy(const std::string &source, const std::string &destination) {
+    // v1 persisted the original Linux LP64 struct, including native padding.
+    // Parse individual fields so host alignment and uninitialized padding are irrelevant.
+    constexpr U64 legacy_entry_size = 32;
+    Descriptor data(::open(source.c_str(), O_RDONLY | O_CLOEXEC));
+    Descriptor index(::open((source + ".idx").c_str(), O_RDONLY | O_CLOEXEC));
+    const U64 data_size = fileSize(data.get());
+    const U64 index_size = fileSize(index.get());
+    require(index_size >= 8, "invalid legacy index header");
+    const U64 count = little(readBytes(index.get(), 0, 8), 0, 8);
+    require((index_size - 8) % legacy_entry_size == 0 && count == (index_size - 8) / legacy_entry_size,
+            "invalid legacy index length or ABI (fetch Git LFS files before migration)");
+    if (std::filesystem::exists(destination)) throw std::runtime_error("migration destination already exists");
+    rejectLegacyIndex(destination);
+    TempFile replacement(destination);
+    U64 offset = file_header_size;
+    U64 live = 0;
+    auto visit = [&](auto &&visitor) {
+        for (U64 i = 0; i < count; ++i) {
+            auto row = readBytes(index.get(), 8 + i * legacy_entry_size, legacy_entry_size);
+            int key = keyAt(row, 0);
+            U64 start = little(row, 8, 8);
+            U64 length = little(row, 16, 8);
+            unsigned char deleted = static_cast<unsigned char>(row[24]);
+            require(deleted <= 1 && start <= data_size && length <= data_size - start,
+                    "invalid legacy index range or deletion flag");
+            visitor(key, start, length, deleted == 1);
+        }
+    };
     {
-        std::cerr << "Failed to save index to file!" << std::endl;
-        return;
+        std::unordered_set<int> seen;
+        visit([&](int key, U64 start, U64 length, bool deleted) {
+            require(seen.insert(key).second, "duplicate key in legacy index");
+            if (deleted) return;
+            std::string body;
+            addOperation(body, true, key, readBytes(data.get(), start, length));
+            writeFrame(replacement.fd.get(), offset, 1, 1, body);
+            offset += frame_header_size + body.size();
+            ++live;
+        });
     }
-
-    // 保存当前索引大小
-    size_t index_size = index_.size();
-    index_file.write(reinterpret_cast<const char *>(&index_size), sizeof(index_size));
-
-    // 保存所有对象的元数据
-    for (const auto &pair : index_)
+    writeAt(replacement.fd.get(), 0, fileHeader(live ? 1 : 0, live));
+    syncFile(replacement.fd.get());
+    // Verify every key and byte using the ordinary v2 recovery and lookup paths.
     {
-        const ObjectMeta &meta = pair.second;
-        index_file.write(reinterpret_cast<const char *>(&meta), sizeof(ObjectMeta));
+        FileStore verified(replacement.path);
+        visit([&](int key, U64 start, U64 length, bool deleted) {
+            ReadResult result = verified.read(key);
+            if (deleted) require(result.status == Status::NotFound, "deleted legacy key survived migration");
+            else require(result.status == Status::Ok && result.value == readBytes(data.get(), start, length),
+                         "legacy migration verification failed");
+        });
     }
-
-    index_file.close();
-}
-
-void FileStore::printFileContext()
-{
-    std::ifstream file(file_path_);
-    if (!file.is_open())
-    {
-        std::cerr << "Failed to open: " << file_path_ << std::endl;
-        return;
-    }
-
-    std::string line;
-    std::cout << "[File context] " << std::endl;
-    while (std::getline(file, line))
-    {
-        std::cout << line << std::endl;
-    }
-
-    file.close();
+    // link() publishes exclusively, including if another migration won a race.
+    rejectLegacyIndex(destination);
+    if (::link(replacement.path.c_str(), destination.c_str()) < 0) ioError("publish migrated database");
+    if (::unlink(replacement.path.c_str()) == 0) replacement.path.clear();
+    syncParent(destination);
 }

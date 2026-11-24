@@ -1,16 +1,15 @@
 #!/usr/bin/env python3
 import os
+import argparse
+from pathlib import Path
 import glob
 import re
 import pandas as pd
 import matplotlib.pyplot as plt
-import seaborn as sns
 from datetime import datetime, timedelta
-import matplotlib.dates as mdates
 from collections import defaultdict
 
-# 设置Seaborn风格
-sns.set_theme(style="whitegrid")
+plt.rcParams['axes.grid'] = True
 
 def extract_start_time(log_path):
     """
@@ -45,7 +44,9 @@ def get_latest_timestamp(log_dir):
             timestamp_dict[log_type].add(timestamp)
     
     # 找到所有日志类型共有的时间戳
-    common_timestamps = set.intersection(*[s for s in timestamp_dict.values() if s])
+    if not timestamp_dict:
+        return None
+    common_timestamps = set.intersection(*timestamp_dict.values())
     if not common_timestamps:
         print("No common timestamp found across log files.")
         return None
@@ -77,8 +78,6 @@ def get_log_files(log_dir):
         log_file = get_log_file(log_dir, log_type, latest_timestamp)
         if os.path.exists(log_file):
             log_files[log_type] = log_file
-        else:
-            print(f"Warning: Expected log file {log_file} does not exist.")
     
     return log_files
 
@@ -135,9 +134,11 @@ def parse_iostat(log_path, sampling_interval=60, start_time=None):
     current_section = None
     headers_cpu = []
     headers_device = []
-    for i, line in enumerate(lines):
+    sample_index = -1
+    for line in lines:
         line = line.strip()
         if line.startswith("avg-cpu"):
+            sample_index += 1
             current_section = 'cpu'
             headers_cpu = []
             continue
@@ -159,6 +160,7 @@ def parse_iostat(log_path, sampling_interval=60, start_time=None):
                 data = line.split()
                 if len(data) >= len(headers_device):
                     device_entry = dict(zip(headers_device, data))
+                    device_entry['sample'] = max(0, sample_index)
                     device_data.append(device_entry)
 
     # 创建CPU DataFrame
@@ -176,19 +178,18 @@ def parse_iostat(log_path, sampling_interval=60, start_time=None):
     for col in iostat_device_df.columns:
         if col not in ['Device']:
             iostat_device_df[col] = pd.to_numeric(iostat_device_df[col], errors='coerce')
-    # 假设所有设备的记录是按时间顺序排列的
-    unique_devices = iostat_device_df['Device'].unique()
-    if len(unique_devices) == 0:
-        num_records = 0
-    else:
-        num_records = len(iostat_device_df) // len(unique_devices)
-    if num_records > 0 and start_time:
-        iostat_device_df['Timestamp'] = pd.date_range(start=start_time, periods=num_records, freq=f'{sampling_interval}s').repeat(len(unique_devices))
-    else:
-        iostat_device_df['Timestamp'] = pd.date_range(start=datetime.now(), periods=0, freq=f'{sampling_interval}s').repeat(len(unique_devices))
-    iostat_device_df.set_index('Timestamp', inplace=True)
-
+    if not iostat_device_df.empty:
+        timestamps = pd.to_timedelta(iostat_device_df.pop('sample') * sampling_interval, unit='s')
+        iostat_device_df['Timestamp'] = (start_time or datetime.now()) + timestamps
+        iostat_device_df.set_index('Timestamp', inplace=True)
     return iostat_cpu_df, iostat_device_df
+
+def disk_gib(text):
+    match = re.fullmatch(r'(\d+(?:\.\d+)?)([KMGTPE]?)(?:i?B?)', text, re.I)
+    if not match:
+        raise ValueError(f'unsupported disk size {text}')
+    exponent = ' KMGTPE'.index(match[2].upper() or ' ')
+    return float(match[1]) * 1024 ** (exponent - 3)
 
 def parse_disk_usage(log_path, sampling_interval=300, start_time=None):
     """
@@ -203,7 +204,7 @@ def parse_disk_usage(log_path, sampling_interval=300, start_time=None):
         if line.startswith("Filesystem"):
             headers = line.strip().split()
             continue
-        if line.startswith("/dev/"):
+        if line.strip() and not line.startswith('Filesystem'):
             data = line.strip().split()
             if len(data) < 5:
                 continue
@@ -213,10 +214,7 @@ def parse_disk_usage(log_path, sampling_interval=300, start_time=None):
                 avail_str = data[3]
                 use_percent_str = data[4]
 
-                # 移除所有非数字和小数点字符
-                size = float(re.sub(r'[^\d.]', '', size_str))
-                used = float(re.sub(r'[^\d.]', '', used_str))
-                avail = float(re.sub(r'[^\d.]', '', avail_str))
+                size, used, avail = (disk_gib(x) for x in (size_str, used_str, avail_str))
                 use_percent = float(use_percent_str.replace('%', ''))
 
                 disk_entry = {
@@ -250,166 +248,68 @@ def parse_disk_usage(log_path, sampling_interval=300, start_time=None):
     return disk_df
 
 def parse_pidstat(log_path, start_time=None):
-    """
-    解析pidstat日志文件
-    """
-    with open(log_path, 'r') as f:
-        lines = f.readlines()
+    """Read CPU and memory samples using the column names of each pidstat section."""
+    day = (start_time or extract_start_time(log_path)).date()
+    previous_time = None
+    header = []
+    cpu_rows, memory_rows = [], []
+    with open(log_path) as stream:
+        for line in stream:
+            parts = line.split()
+            if not parts or not re.fullmatch(r'\d{2}:\d{2}:\d{2}', parts[0]):
+                continue
+            clock_text = parts.pop(0)
+            clock_format = '%H:%M:%S'
+            if parts and parts[0] in ('AM', 'PM'):
+                clock_text += ' ' + parts.pop(0)
+                clock_format = '%I:%M:%S %p'
+            if 'PID' in parts and 'Command' in parts:
+                header = parts
+                continue
+            if not header or len(parts) < len(header):
+                continue
 
-    cpu_data = []
-    mem_data = []
-    current_section = None
-
-    # 从文件名提取日期，作为初始日期
-    # 假设文件名格式: pidstat_YYYYMMDD_HHMMSS.log
-    match = re.search(r'_(\d{8})_(\d{6})\.log$', log_path)
-    if match:
-        date_str = match.group(1)  # '20241217'
-        time_str = match.group(2)  # '222151'
-        try:
-            start_date = datetime.strptime(date_str, "%Y%m%d").date()  # date对象，不包括时间
-        except ValueError as ve:
-            print(f"Error parsing start date: {ve}")
-            start_date = datetime.now().date()
-    else:
-        print("Cannot extract date from filename, use current date.")
-        start_date = datetime.now().date()
-
-    # 用于跨日检测
-    last_time_of_day = None
-    current_date = start_date
-
-    # 正则匹配行首时间，例如：22:21:54
-    time_pattern = re.compile(r'^(\d{2}):(\d{2}):(\d{2})')
-
-    for i in range(len(lines)):
-        line = lines[i].strip()
-        # 检查是否以时间戳开头 (HH:MM:SS)
-        time_match = time_pattern.match(line)
-        if time_match:
-            timestamp_str = time_match.group(0)  # 'HH:MM:SS'
-            headers = line.split()[1:]
-            # 判断是CPU还是内存监控
-            if 'minflt/s' in headers:
-                current_section = 'mem'
+            fields = dict(zip(header, parts))
+            if '%CPU' in fields:
+                samples = cpu_rows
+            elif '%MEM' in fields:
+                samples = memory_rows
             else:
-                current_section = 'cpu'
+                continue
+            sample_time = datetime.strptime(clock_text, clock_format).time()
+            if previous_time is not None and sample_time < previous_time:
+                day += timedelta(days=1)
+            previous_time = sample_time
+            fields['Timestamp'] = datetime.combine(day, sample_time)
+            fields['Command'] = ' '.join(parts[len(header) - 1:])
+            samples.append(fields)
 
-            # 下一行是数据行
-            if i + 1 < len(lines):
-                data_line = lines[i + 1].strip()
-                data = data_line.split()
-                if current_section == 'cpu':
-                    if len(data) >= 9:
-                        # 处理可能的命令名称包含空格
-                        command = ' '.join(data[9:]) if len(data) > 9 else data[8]
-                        try:
-                            # 解析当前时间
-                            hh, mm, ss = map(int, timestamp_str.split(':'))
-                            current_time_of_day = (hh, mm, ss)
+    def frame(rows):
+        data = pd.DataFrame(rows)
+        if data.empty:
+            return data
+        data.set_index('Timestamp', inplace=True)
+        for column in data.columns.difference(['Command', 'UID']):
+            data[column] = pd.to_numeric(data[column], errors='coerce')
+        return data
 
-                            # 检测是否跨日
-                            if last_time_of_day is not None:
-                                if current_time_of_day < last_time_of_day:
-                                    # 日期加1
-                                    current_date = current_date + timedelta(days=1)
-
-                            last_time_of_day = current_time_of_day
-
-                            # 构造datetime对象
-                            timestamp = datetime(
-                                current_date.year, current_date.month, current_date.day,
-                                hh, mm, ss
-                            )
-
-                            entry = {
-                                'Timestamp': timestamp,
-                                'UID': data[1],
-                                'PID': int(data[2]),
-                                '%usr': float(data[3]),
-                                '%system': float(data[4]),
-                                '%guest': float(data[5]),
-                                '%wait': float(data[6]),
-                                '%CPU': float(data[7]),
-                                'CPU': int(data[8]),
-                                'Command': command
-                            }
-                            cpu_data.append(entry)
-                        except ValueError as ve:
-                            print(f"Error parsing CPU data line: {ve}")
-                elif current_section == 'mem':
-                    if len(data) >= 8:
-                        # 处理可能的命令名称包含空格
-                        command = ' '.join(data[7:]) if len(data) > 7 else data[6]
-                        try:
-                            # 解析当前时间
-                            hh, mm, ss = map(int, timestamp_str.split(':'))
-                            current_time_of_day = (hh, mm, ss)
-
-                            # 检测是否跨日
-                            if last_time_of_day is not None:
-                                if current_time_of_day < last_time_of_day:
-                                    # 日期加1
-                                    current_date = current_date + timedelta(days=1)
-
-                            last_time_of_day = current_time_of_day
-
-                            # 构造datetime对象
-                            timestamp = datetime(
-                                current_date.year, current_date.month, current_date.day,
-                                hh, mm, ss
-                            )
-
-                            entry = {
-                                'Timestamp': timestamp,
-                                'UID': data[1],
-                                'PID': int(data[2]),
-                                'minflt/s': float(data[3]),
-                                'majflt/s': float(data[4]),
-                                'VSZ': int(data[5]),
-                                'RSS': int(data[6]),
-                                '%MEM': float(data[7]),
-                                'Command': command
-                            }
-                            mem_data.append(entry)
-                        except ValueError as ve:
-                            print(f"Error parsing memory data line: {ve}")
-
-    # 创建DataFrame
-    pidstat_cpu_df = pd.DataFrame(cpu_data)
-    if not pidstat_cpu_df.empty:
-        pidstat_cpu_df.set_index('Timestamp', inplace=True)
-
-    pidstat_mem_df = pd.DataFrame(mem_data)
-    if not pidstat_mem_df.empty:
-        pidstat_mem_df.set_index('Timestamp', inplace=True)
-
-    return pidstat_cpu_df, pidstat_mem_df
+    return frame(cpu_rows), frame(memory_rows)
 
 def parse_stress_test_log(log_path):
     """
     解析stress_test日志文件
     """
-    elapsed_times = []
-    throughput = []
-
-    with open(log_path, 'r') as f:
-        for line in f:
-            match = re.search(r'\[Stats\] Elapsed: (\d+)s .* Throughput: (\d+) ops/s', line)
+    records = []
+    old = re.compile(r'\[Stats\] Elapsed: (\d+)s .* Throughput: ([\d.]+) ops/s')
+    new = re.compile(r'\[Window\] elapsed_s=([\d.]+) window_s=[\d.]+ operations=\d+ ops_per_sec=([\d.]+)')
+    with open(log_path, 'r') as stream:
+        for line in stream:
+            match = new.search(line) or old.search(line)
             if match:
-                elapsed = int(match.group(1))
-                th = int(match.group(2))
-                elapsed_times.append(elapsed)
-                throughput.append(th)
-    
-    stress_test_df = pd.DataFrame({
-        'Elapsed Time (s)': elapsed_times,
-        'Throughput (ops/s)': throughput
-    })
+                records.append((float(match[1]), float(match[2])))
+    return pd.DataFrame(records, columns=['Elapsed Time (s)', 'Throughput (ops/s)'])
 
-    return stress_test_df
-
-def plot_cpu_usage(vmstat_df, iostat_cpu_df, pidstat_cpu_df):
+def plot_cpu_usage(vmstat_df, iostat_cpu_df, pidstat_cpu_df, charts_dir):
     """
     绘制CPU使用率图表
     """
@@ -436,10 +336,10 @@ def plot_cpu_usage(vmstat_df, iostat_cpu_df, pidstat_cpu_df):
     plt.title('CPU Usage Over Time')
     plt.legend()
     plt.tight_layout()
-    plt.savefig('./charts/cpu_usage.png')
-    plt.show()
+    plt.savefig(charts_dir / 'cpu_usage.png')
+    plt.close()
 
-def plot_memory_usage(vmstat_df, pidstat_mem_df):
+def plot_memory_usage(vmstat_df, pidstat_mem_df, charts_dir):
     """
     绘制内存使用率图表，使用双 Y 轴
     """
@@ -474,32 +374,31 @@ def plot_memory_usage(vmstat_df, pidstat_mem_df):
     
     plt.title('Memory Usage Over Time')
     plt.tight_layout()
-    plt.savefig('./charts/memory_usage.png')
-    plt.show()
+    plt.savefig(charts_dir / 'memory_usage.png')
+    plt.close()
 
-def plot_disk_io(iostat_device_df):
+def plot_disk_io(iostat_device_df, charts_dir):
     """
     绘制磁盘IO图表
     """
-    plt.figure(figsize=(14, 7))
+    required = {'Device', 'rkB/s', 'wkB/s', '%util'}
+    if not required.issubset(iostat_device_df.columns):
+        return
+    fig, (rates, util) = plt.subplots(2, 1, figsize=(14, 8), sharex=True)
+    for device, samples in iostat_device_df.groupby('Device'):
+        rates.plot(samples.index, samples['rkB/s'], label=f'{device} read')
+        rates.plot(samples.index, samples['wkB/s'], label=f'{device} write')
+        util.plot(samples.index, samples['%util'], label=device)
+    rates.set_ylabel('kB/s')
+    util.set_ylabel('Utilization (%)')
+    util.set_xlabel('Time')
+    rates.legend()
+    util.legend()
+    fig.tight_layout()
+    fig.savefig(charts_dir / 'disk_io.png')
+    plt.close(fig)
 
-    # 以sdc设备为例
-    sdc_df = iostat_device_df[iostat_device_df['Device'] == 'sdc']
-
-    if not sdc_df.empty:
-        plt.plot(sdc_df.index, sdc_df['rkB/s'], label='Read KB/s', color='blue')
-        plt.plot(sdc_df.index, sdc_df['wkB/s'], label='Write KB/s', color='orange')
-        plt.plot(sdc_df.index, sdc_df['%util'], label='%util', color='green')
-
-    plt.xlabel('Time')
-    plt.ylabel('Disk IO (KB/s) / %util')
-    plt.title('Disk IO Over Time (Device: sdc)')
-    plt.legend()
-    plt.tight_layout()
-    plt.savefig('./charts/disk_io.png')
-    plt.show()
-
-def plot_disk_usage(disk_df):
+def plot_disk_usage(disk_df, charts_dir):
     """
     绘制磁盘使用情况图表
     """
@@ -507,19 +406,19 @@ def plot_disk_usage(disk_df):
     
     plt.figure(figsize=(14, 7))
 
-    plt.plot(disk_df.index, disk_df['Used'], label='Used (G)', color='blue')
-    plt.plot(disk_df.index, disk_df['Avail'], label='Available (G)', color='orange')
+    plt.plot(disk_df.index, disk_df['Used'], label='Used (GiB)', color='blue')
+    plt.plot(disk_df.index, disk_df['Avail'], label='Available (GiB)', color='orange')
     plt.plot(disk_df.index, disk_df['Use%'], label='Use% (%)', color='green')
 
     plt.xlabel('Time')
-    plt.ylabel('Disk Usage (G) / Usage (%)')
+    plt.ylabel('Disk Usage (GiB) / Usage (%)')
     plt.title('Disk Usage Over Time')
     plt.legend()
     plt.tight_layout()
-    plt.savefig('./charts/disk_usage.png')
-    plt.show()
+    plt.savefig(charts_dir / 'disk_usage.png')
+    plt.close()
 
-def plot_process_metrics(pidstat_cpu_df, pidstat_mem_df):
+def plot_process_metrics(pidstat_cpu_df, pidstat_mem_df, charts_dir):
     """
     绘制进程的CPU和内存使用情况图表
     """
@@ -535,106 +434,81 @@ def plot_process_metrics(pidstat_cpu_df, pidstat_mem_df):
     plt.title('Process CPU and Memory Usage Over Time')
     plt.legend()
     plt.tight_layout()
-    plt.savefig('./charts/process_metrics.png')
-    plt.show()
+    plt.savefig(charts_dir / 'process_metrics.png')
+    plt.close()
 
-def plot_stress_test_throughput(df):
+def plot_stress_test_throughput(df, charts_dir):
     """
     绘制stress_test的吞吐量图表
     """
     plt.figure(figsize=(14, 7))
-    plt.plot(df['Elapsed Time (s)'], df['Throughput (ops/s)'], label='Total Throughput (ops/s)', color='blue')
+    plt.plot(df['Elapsed Time (s)'], df['Throughput (ops/s)'], label='Throughput (ops/s)', color='blue')
     plt.xlabel('Elapsed Time (s)')
     plt.ylabel('Throughput (ops/s)')
     plt.title('Stress Test Throughput Over Time')
     plt.legend()
     plt.tight_layout()
-    plt.savefig('./charts/stress_test_throughput.png')
-    plt.show()
+    plt.savefig(charts_dir / 'stress_test_throughput.png')
+    plt.close()
 
 def main():
-    # 设置日志文件路径
-    log_dir = "./logs"
-    # vmstat_log = os.path.join(log_dir, "vmstat_20241217_222151.log")
-    # iostat_log = os.path.join(log_dir, "iostat_20241217_222151.log")
-    # disk_usage_log = os.path.join(log_dir, "disk_usage_20241217_222151.log")
-    # pidstat_log = os.path.join(log_dir, "pidstat_20241217_222151.log")
-    # stress_test_log = os.path.join(log_dir,"stress_test_20241217_222151.log")
-    
-        # 自动获取日志文件
-    log_files = get_log_files(log_dir)
-    
-    if not log_files:
-        print("No valid log files found. Exiting.")
-        return
-    
-    vmstat_log = log_files.get('vmstat')
-    iostat_log = log_files.get('iostat')
-    disk_usage_log = log_files.get('disk_usage')
-    pidstat_log = log_files.get('pidstat')
-    stress_test_log = log_files.get('stress_test')
-    
-    # 提取开始时间
-    start_time = extract_start_time(vmstat_log)
-    # print(f"Extracted start_time: {start_time}") 
+    parser = argparse.ArgumentParser(description='Plot one KV stress run and available Linux resource samples.')
+    parser.add_argument('--log-dir', help='Directory printed by run_stress_test.sh')
+    parser.add_argument('--charts-dir', help='Output directory (default: charts/ within the selected log directory)')
+    args = parser.parse_args()
+    if args.log_dir:
+        log_dir = Path(args.log_dir)
+    else:
+        runs = sorted(path for path in Path('logs').glob('run_*') if path.is_dir())
+        log_dir = runs[-1] if runs else Path('logs')
+    log_files = get_log_files(str(log_dir))
+    if not log_files or 'stress_test' not in log_files:
+        parser.exit(1, f'No stress log in {log_dir}\n')
+    charts_dir = Path(args.charts_dir) if args.charts_dir else log_dir / 'charts'
+    charts_dir.mkdir(parents=True, exist_ok=True)
+    start_time = extract_start_time(log_files['stress_test'])
+    vmstat_df = pd.DataFrame()
+    iostat_cpu_df, iostat_device_df = pd.DataFrame(), pd.DataFrame()
+    pidstat_cpu_df, pidstat_mem_df = pd.DataFrame(), pd.DataFrame()
+    disk_df = pd.DataFrame()
+    if 'vmstat' in log_files:
+        vmstat_df = parse_vmstat(log_files['vmstat'], start_time=start_time)
+    if 'iostat' in log_files:
+        iostat_cpu_df, iostat_device_df = parse_iostat(log_files['iostat'], start_time=start_time)
+    if 'disk_usage' in log_files:
+        disk_df = parse_disk_usage(log_files['disk_usage'], start_time=start_time)
+    if 'pidstat' in log_files:
+        pidstat_cpu_df, pidstat_mem_df = parse_pidstat(log_files['pidstat'], start_time=start_time)
+    stress_test_df = parse_stress_test_log(log_files['stress_test'])
 
-    # 解析日志文件
-    print("Parsing vmstat log...")
-    vmstat_df = parse_vmstat(vmstat_log, sampling_interval=60, start_time=start_time)
-
-    print("Parsing iostat log...")
-    iostat_cpu_df, iostat_device_df = parse_iostat(iostat_log, sampling_interval=60, start_time=start_time)
-
-    print("Parsing disk_usage log...")
-    disk_df = parse_disk_usage(disk_usage_log, sampling_interval=300, start_time=start_time)
-
-    print("Parsing pidstat log...")
-    pidstat_cpu_df, pidstat_mem_df = parse_pidstat(pidstat_log, start_time=start_time)
-    
-    print("Parsing stress test log...")
-    stress_test_df = parse_stress_test_log(stress_test_log)
-
-    # 检查DataFrame是否为空
-    if vmstat_df.empty:
-        print("vmstat_df is empty. Please check the vmstat log file format.")
-    if iostat_cpu_df.empty:
-        print("iostat_cpu_df is empty. Please check the iostat log file format.")
-    if iostat_device_df.empty:
-        print("iostat_device_df is empty. Please check the iostat log file format.")
-    if disk_df.empty:
-        print("disk_df is empty. Please check the disk_usage log file format.")
-    if pidstat_cpu_df.empty:
-        print("pidstat_cpu_df is empty. Please check the pidstat log file format.")
-    if pidstat_mem_df.empty:
-        print("pidstat_mem_df is empty. Please check the pidstat log file format.")
     if stress_test_df.empty:
-        print("stress_test_df is empty. Please check the stress test log file format.")
-        
+        print("No throughput samples found in the selected stress log.")
+
     # 生成图表
     if not vmstat_df.empty and not iostat_cpu_df.empty and not pidstat_cpu_df.empty:
         print("Generating CPU usage chart...")
-        plot_cpu_usage(vmstat_df, iostat_cpu_df, pidstat_cpu_df)
+        plot_cpu_usage(vmstat_df, iostat_cpu_df, pidstat_cpu_df, charts_dir)
 
     if not vmstat_df.empty and not pidstat_mem_df.empty:
         print("Generating memory usage chart...")
-        plot_memory_usage(vmstat_df, pidstat_mem_df)
+        plot_memory_usage(vmstat_df, pidstat_mem_df, charts_dir)
 
     if not iostat_device_df.empty:
         print("Generating Disk IO chart...")
-        plot_disk_io(iostat_device_df)
+        plot_disk_io(iostat_device_df, charts_dir)
 
     if not disk_df.empty:
         print("Generating Disk Usage chart...")
-        plot_disk_usage(disk_df)
+        plot_disk_usage(disk_df, charts_dir)
 
     if not pidstat_cpu_df.empty or not pidstat_mem_df.empty:
         print("Generating Process CPU and Memory Usage chart...")
-        plot_process_metrics(pidstat_cpu_df, pidstat_mem_df)
+        plot_process_metrics(pidstat_cpu_df, pidstat_mem_df, charts_dir)
         
     if not stress_test_df.empty:
-        plot_stress_test_throughput(stress_test_df)
+        plot_stress_test_throughput(stress_test_df, charts_dir)
 
-    print("All charts have been generated and saved in the current directory.")
+    print(f"Charts directory: {charts_dir}")
 
 if __name__ == "__main__":
     main()

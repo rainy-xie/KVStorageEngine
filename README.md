@@ -1,98 +1,83 @@
-# Linux环境高级编程：小对象存储引擎
+# 小对象 KV 存储引擎
 
-## 要求
+面向 Linux 的 C++20 嵌入式存储库。一个数据库使用一个追加写数据文件，整型键映射到任意字节串，包括空串和含有零字节的值。多个线程可以共享一个引擎实例。新接口提供版本条件写、原子批量写入和一致批量读取。
 
-目标:完成支持K/V形式的小对象存储功能，提供包括对象的GET/PUT/DEL的多线程事务操作。
-形式要求:基于C/C++，提供上述接口，并封装为SO库。
-实现约束:
+## 重构清单
 
-1)所有小对象需统一存储在一个大文件中，设计内存缓存对小对象进行CACHE，Key为整型，Value支持任意数据结构;
+- [x] **修复并发和关闭。** 同键读、写、删除与缓存回填保持一致。已接收的异步请求在析构前完成，GC 等待可以唤醒。
+- [x] **引入可恢复的单文件格式。** 从日志重建索引，识别未写完的尾批和损坏记录，压缩后保留版本。旧库通过显式迁移保留原件。
+- [x] **实现条件写入。** 同一旧版本只有一个写者能成功，删除重建后的对象具有新版本。
+- [x] **实现原子批量写入。** 一个批次按给定顺序执行，批量读取看到同一时刻的状态，进程异常退出后恢复完整批次。
+- [x] **实现组提交。** 多个独立请求可以共享一次持久化同步，成功确认在同步之后返回。
+- [x] **验证与对照。** 运行兼容性测试、故障恢复测试，以及相同持久化设置下的逐请求同步与组提交短测。
+- [x] **千万键规模。** 已实际预填 1,000 万个不同键并完成短轮混合操作，重开后逐键核对。
+- [ ] **课程长测。** 在目标 Linux 机器上运行 12 小时混合读写并采集资源数据。
 
-2)参考文件系统模型设计大文件的物理对象存储模型，元数据与对象数据寻址方法;
+## 构建与运行
 
-3)需支持多线程环境，采用多生产者多消费者模型;完成持续读写压力测试，运行时间不低于12小时，插入对象不低于1千万个，观察CPU，内存，磁盘开销，并将压测分析输出到报告中。
-
-
-## 项目架构
-
-![alt text](architecture.png)
-
-## 项目组织
-
-```
-.
-├── include            # 头文件目录
-│   ├── cache.h        # 缓存相关头文件
-│   ├── engine.h       # 引擎相关头文件
-│   ├── file_store.h   # 文件存储相关头文件
-│   └── thread_pool.h  # 线程池相关头文件
-├── src                # 源代码目录
-│   ├── cache.cpp      
-│   ├── engine.cpp     
-│   ├── file_store.cpp 
-│   └── thread_pool.cpp
-├── build              # 构建输出目录
-├── tests              # 测试代码目录，存有单元测试和压力测试的代码
-├── lib                # 库文件目录，存放.so文件
-├── bin                # 可执行文件目录
-├── docs               # 文档目录
-├── charts             # 图表目录
-├── logs               # 日志目录
-├── tmp                # 临时文件目录
-├── data               # 数据目录
-└── Makefile           # Makefile 构建脚本
+```sh
+make -j4
+./out/bin/main
+make test
 ```
 
-## 项目构建
+`make` 构建动态库、示例和压力测试。Linux 库位于 `out/lib/libstorage_engine.so`，macOS 位于 `out/lib/libstorage_engine.dylib`。示例在临时目录里验证条件写、批量移动和重开后的异步读取。运行单元测试需要 GoogleTest，可使用系统安装的开发包，或用 `make test GTEST_DIR=/path/to/googletest` 指定含 `src/gtest-all.cc` 的源码目录。运行新版功能与恢复用例可通过 `TEST_ARGS=--gtest_filter='KVv2Test.*'` 筛选。
 
-构建整个项目，将在bin下生成所有的可执行文件：
+## 公开接口
 
-```bash
-make
+```cpp
+StorageEngine db("objects.dat");
+auto created = db.putIfVersion(7, 0, "draft");  // 只在键不存在时创建
+auto item = db.read(7);                         // {status, value, version}
+auto updated = db.putIfVersion(7, item.version, "final");
+auto moved = db.writeBatch({Mutation::put(8, "final"), Mutation::del(7)});
+auto items = db.multiGet({7, 8});               // 保留输入顺序
 ```
 
-单元测试（使用了**Google test**框架）：
+`read` 用 `Ok`、`NotFound` 和 `IOError` 区分有效值、缺失和读取失败。版本 0 表示当前缺失，条件不满足返回 `Conflict`。同一批内可多次修改同一键，批内删除缺失键和提交空批都成功。一次 `multiGet` 在同一视图内读取所有键。原有 `put/get/del` 和回调接口继续可用，旧 `get` 对空值与缺失都返回空串。同一文件一次只允许一个打开的引擎实例。升级库后需重新编译调用方。
 
-```bash
-make tests
+同步接口与异步回调复用相同的读写路径。`stop()` 停止接收新的异步请求，已接收的请求继续完成，析构会等待它们。停止后提交的旧异步读回调收到空串，写和删除回调收到 `false`。
+
+`StorageEngine` 的第五个构造参数为 `CommitOptions`。默认开启持久化同步，允许将最多 32 个请求合在一次同步中，默认不主动等待凑组。设置 `max_group_size=1` 即为逐请求同步。`group_delay` 可以配置聚合窗口。设为 `durable=false` 会在记录写入操作系统后返回，掉电可能丢失近期写入。`commitStats()` 提供当前实例已提交的请求数和写请求触发的同步调用数。若追加或同步发生 I/O 错误，引擎会停止确认新写入。出错请求可能已写入，调用方可重开核对后再决定是否重试。
+
+## 存储与旧库迁移
+
+版本、索引偏移和缓存由引擎管理。文件中的批记录含操作、键、值及校验信息，启动时按文件顺序回放，截去可识别的未完成尾批。完整批的校验错误会使打开失败并保留原文件。GC 在同目录写入临时文件并替换数据文件。现存对象的版本及已分配版本的高水位会一同保留。
+
+旧版数据文件仅含原始 value，迁移需要匹配的 `.idx`。停止旧程序，确认源文件是实际的原版 64 位小端数据及索引，然后把结果写入一个新路径。
+
+```sh
+./out/bin/main --migrate old.dat new.dat
 ```
 
-对单元测试中代码覆盖率进行分析（使用工具 **gcov** 和 **lcov**）：
+## 压测与验证
 
-```bash
-lcov --capture --directory . --output-file coverage.info --exclude '/usr/*'
-genhtml coverage.info --output-directory ./docs/coverage_report --ignore-errors source
+以下两次短测使用相同的操作序列和同步保证。每次压测使用一个新目录，重开后关闭缓存，对照每个键的预期值和删除状态。每个生产者拥有独立键区间。同键竞争由单元测试另外验证。
+
+```sh
+./out/bin/stress_test --keys 10000 --operations 60000 --producers 16 --workers 16 --seed 42 --mode single
+./out/bin/stress_test --keys 10000 --operations 60000 --producers 16 --workers 16 --seed 42 --mode group --group-delay-us 0
 ```
 
-压力测试
+本机 macOS arm64 的三轮短测均完成全量核对。各轮轮换测试顺序。表中是混合阶段各指标的中位数，排除预填、重开和核对耗时。每轮均有 32,369 个成功写请求。吞吐量包括读、写、删，P99 是端到端耗时直方图的桶上界。
 
-```bash
-make stress
+| 同步方式 | 写请求触发的 fsync 次数 | 混合操作/秒 | P99 上界 |
+| --- | ---: | ---: | ---: |
+| 逐请求同步 | 32,369 | 47,411 | 1,024 µs |
+| 组提交，等待 0 µs | 5,850 | 88,702 | 512 µs |
+| 组提交，等待 200 µs | 2,548 | 57,654 | 1,024 µs |
+
+在这组负载下，直接合并已排队请求的吞吐量最高。增加等待窗口进一步减少了同步次数，也增加了请求等待时间。引擎默认等待 0 µs，压测程序的 group 模式默认使用 200 µs。可用 `--group-delay-us` 显式选择。另一次规模验证预填了 1,000 万个不同键，混合执行 10,000 次操作，重开后全量核对通过，包含 9,996,747 个存活键和 3,253 个已删除键。
+
+默认课程负载为 1,000 万个不同键、16 个生产者、16 个工作线程、预填后 43,200 秒混合读写。压测按窗口输出吞吐量，并按阶段计数。Linux 上安装 `procps` 和 `sysstat` 后，以下脚本同时采集 CPU、内存和磁盘指标，并打印独立的日志目录。绘图需要 pandas 和 matplotlib。
+
+```sh
+./run_stress_test.sh
+python3 log_analysis.py --log-dir logs/run_实际目录名
 ```
 
-对压力测试进行数据分析的脚本：
+本地回归包括原有 7 项测试及 16 项新增测试。23 项在普通构建和 AddressSanitizer + UndefinedBehaviorSanitizer 构建下均通过，7 项并发与关闭测试另经 ThreadSanitizer 重复 4 轮。子进程测试覆盖异常退出与写入错误，实际断电和目标 Linux 上的 12 小时运行仍待验证。
 
-```bash
-./run_stress_test.sh 
-```
+## 原课程资料
 
-生成的日志文件记录在logs目录下，运行下面的脚本对数据进行分析并把可视化的图表输出在charts目录：
-
-```bash
-python3 log_analysis.py 
-```
-
-生成gprof性能报告：
-
-```bash
-gprof ./bin/stress_test gmon.out > docs/gprof_analysis_report.txt
-```
-
-gprof中的调用图转为图像：
-
-```bash
-gprof2dot -f prof docs/gprof_analysis_report.txt -o docs/gprof_call_graph.dot
-dot -Tpng docs/gprof_call_graph.dot -o charts/gprof_call_graph.png
-```
-
-注：因github上传文件大小不能超过100M的限制，long_stress_test_db.dat及long_stress_test_db.dat.idx未能上传，可以自行运行压力测试并生成。
+原课程要求交付共享库，在多生产者、多消费者负载下运行至少 12 小时并插入至少 1,000 万个对象，记录 CPU、内存和磁盘开销。原实验报告、架构图、覆盖率和性能图表分别保存在 `docs/`、`architecture.png` 和 `charts/`。历史 `bin/`、`lib/` 和 `build/` 是旧版构建产物。通过 Git LFS 保存的旧数据和日志需要先取得完整内容。

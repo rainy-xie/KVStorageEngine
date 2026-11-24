@@ -1,2 +1,6 @@
 KVStore_demo.zip
 .vscode/settings.json
+
+/out/
+/data/stress-*/
+/logs/run_*/

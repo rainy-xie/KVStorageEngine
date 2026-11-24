@@ -1,91 +1,77 @@
-# 编译器及编译选项
-CXX = g++
-CXXFLAGS = -std=c++20 -Wall -Wextra -O2 -g --coverage -fPIC -pg -I$(INCLUDE_DIR) -I/usr/local/include
-LDFLAGS = -L/usr/local/lib -lpthread -lgtest -lgtest_main -pg --coverage
+CXX ?= c++
+CXXFLAGS ?= -O2 -g
+CPPFLAGS += -Iinclude
+CXX_STANDARD = -std=c++20
+COMPILE = $(CXX) $(CPPFLAGS) $(CXX_STANDARD) $(CXXFLAGS) -Wall -Wextra -pthread -fPIC -MMD -MP
 
-# 项目目录结构
-SRC_DIR = src
-INCLUDE_DIR = include
-BUILD_DIR = build
-TEST_DIR = tests
-LIB_DIR = lib
-BIN_DIR = bin
+OUT ?= out
+OBJ = $(OUT)/obj
+BIN = $(OUT)/bin
+LIB = $(OUT)/lib
+LIB_SRC = $(filter-out src/main.cpp,$(wildcard src/*.cpp))
+LIB_OBJ = $(patsubst src/%.cpp,$(OBJ)/src/%.o,$(LIB_SRC))
+TEST_SRC = $(filter-out tests/stress_test.cpp,$(wildcard tests/*.cpp))
+TEST_OBJ = $(patsubst tests/%.cpp,$(OBJ)/tests/%.o,$(TEST_SRC))
 
-# 源文件
-SRC = $(wildcard $(SRC_DIR)/*.cpp)
-SRC_NO_MAIN = $(filter-out $(SRC_DIR)/main.cpp, $(SRC))
-OBJ = $(patsubst $(SRC_DIR)/%.cpp,$(BUILD_DIR)/%.o,$(SRC_NO_MAIN))
+ifeq ($(shell uname -s),Darwin)
+SHARED_LIB = $(LIB)/libstorage_engine.dylib
+SHARED_FLAGS = -dynamiclib -Wl,-install_name,@rpath/libstorage_engine.dylib
+RPATH = -Wl,-rpath,@loader_path/../lib
+else
+SHARED_LIB = $(LIB)/libstorage_engine.so
+SHARED_FLAGS = -shared
+RPATH = -Wl,-rpath,'$$ORIGIN/../lib'
+endif
+LINK_ENGINE = -L$(LIB) -lstorage_engine $(RPATH) -pthread
 
-# 业务主程序文件
-MAIN_OBJ = $(BUILD_DIR)/main.o
+# An existing GoogleTest source tree can also be used for offline builds.
+GTEST_DIR ?= $(if $(wildcard $(OUT)/deps/googletest/src/gtest-all.cc),$(OUT)/deps/googletest)
+ifeq ($(strip $(GTEST_DIR)),)
+GTEST_CFLAGS ?= $(shell pkg-config --cflags gtest 2>/dev/null)
+GTEST_LIBS ?= $(shell pkg-config --libs gtest 2>/dev/null || echo -lgtest)
+else
+GTEST_CFLAGS = -isystem $(GTEST_DIR)/include
+GTEST_OBJ = $(OBJ)/gtest-all.o
+$(GTEST_OBJ): $(GTEST_DIR)/src/gtest-all.cc
+	@mkdir -p $(@D)
+	$(COMPILE) $(GTEST_CFLAGS) -I$(GTEST_DIR) -c $< -o $@
+endif
 
-# 测试文件
-TEST_SRC = $(wildcard $(TEST_DIR)/*.cpp)
-TEST_OBJ = $(patsubst $(TEST_DIR)/%.cpp,$(BUILD_DIR)/%.o,$(TEST_SRC))
-TEST_BIN = $(BIN_DIR)/tests
-STRESS_TEST_OBJ = $(BUILD_DIR)/stress_test.o
-STRESS_TEST_BIN = $(BIN_DIR)/stress_test
+.DEFAULT_GOAL := all
+.PHONY: all test tests stress clean
+all: $(SHARED_LIB) $(BIN)/main $(BIN)/stress_test
 
-# 动态库与静态库
-LIB_SO = $(LIB_DIR)/libstorage_engine.so
-LIB_A = $(LIB_DIR)/libstorage_engine.a
+$(OBJ)/src/%.o: src/%.cpp
+	@mkdir -p $(@D)
+	$(COMPILE) -c $< -o $@
 
-# 默认目标
-all: $(BIN_DIR)/main $(LIB_SO) $(TEST_BIN) $(STRESS_TEST_BIN)
+$(OBJ)/tests/%.o: tests/%.cpp
+	@mkdir -p $(@D)
+	$(COMPILE) $(GTEST_CFLAGS) -c $< -o $@
 
-# 编译源文件为对象文件（不包含main.cpp）
-$(BUILD_DIR)/%.o: $(SRC_DIR)/%.cpp
-	mkdir -p $(BUILD_DIR)
-	$(CXX) $(CXXFLAGS) -I$(INCLUDE_DIR) -c $< -o $@
+$(SHARED_LIB): $(LIB_OBJ)
+	@mkdir -p $(@D)
+	$(CXX) $(LDFLAGS) $(SHARED_FLAGS) $^ -pthread $(LDLIBS) -o $@
 
-# 编译main.cpp
-$(MAIN_OBJ): $(SRC_DIR)/main.cpp
-	mkdir -p $(BUILD_DIR)
-	$(CXX) $(CXXFLAGS) -I$(INCLUDE_DIR) -c $< -o $@
+$(BIN)/main: $(OBJ)/src/main.o $(SHARED_LIB)
+	@mkdir -p $(@D)
+	$(CXX) $(LDFLAGS) $< $(LINK_ENGINE) $(LDLIBS) -o $@
 
-# 编译测试文件为对象文件
-$(BUILD_DIR)/%.o: $(TEST_DIR)/%.cpp
-	mkdir -p $(BUILD_DIR)
-	$(CXX) $(CXXFLAGS) -I$(INCLUDE_DIR) -c $< -o $@
+$(BIN)/stress_test: $(OBJ)/tests/stress_test.o $(SHARED_LIB)
+	@mkdir -p $(@D)
+	$(CXX) $(LDFLAGS) $< $(LINK_ENGINE) $(LDLIBS) -o $@
 
-# 生成业务主程序
-$(BIN_DIR)/main: $(MAIN_OBJ) $(OBJ) $(LIB_SO)
-	mkdir -p $(BIN_DIR)
-	$(CXX) -o $@ $^ $(LDFLAGS)
+$(BIN)/tests: $(TEST_OBJ) $(GTEST_OBJ) $(SHARED_LIB)
+	@mkdir -p $(@D)
+	$(CXX) $(LDFLAGS) $(TEST_OBJ) $(GTEST_OBJ) $(GTEST_LIBS) $(LINK_ENGINE) $(LDLIBS) -o $@
 
-# 生成动态库
-$(LIB_SO): $(OBJ)
-	mkdir -p $(LIB_DIR)
-	$(CXX) -shared -o $@ $^ $(LDFLAGS)
+test tests: $(BIN)/tests
+	$(BIN)/tests $(TEST_ARGS)
 
-# 生成静态库
-$(LIB_A): $(OBJ)
-	mkdir -p $(LIB_DIR)
-	ar rcs $@ $^
-
-# 生成单元测试可执行文件
-$(TEST_BIN): $(filter-out $(STRESS_TEST_OBJ),$(TEST_OBJ)) $(OBJ) $(LIB_SO)
-	mkdir -p $(BIN_DIR)
-	$(CXX) -o $@ $^ $(LDFLAGS)
-
-# 生成压力测试可执行文件 stress_test
-$(STRESS_TEST_BIN): $(STRESS_TEST_OBJ) $(OBJ) $(LIB_SO)
-	mkdir -p $(BIN_DIR)
-	$(CXX) -o $@ $(STRESS_TEST_OBJ) $(LIB_SO) $(LDFLAGS)
-
-# 运行单元测试程序
-test: $(TEST_BIN)
-	@echo "Running tests..."
-	$(TEST_BIN)
-
-# 运行压力测试程序（独立于单元测试）
-stress: $(STRESS_TEST_BIN)
-	@echo "Running stress test..."
-	$(STRESS_TEST_BIN)
+stress: $(BIN)/stress_test
+	$(BIN)/stress_test $(STRESS_ARGS)
 
 clean:
-	rm -rf $(BUILD_DIR) $(LIB_DIR) $(BIN_DIR)
+	$(RM) -r $(OBJ) $(BIN) $(LIB)
 
-distclean: clean
-	rm -f $(TEST_BIN) $(STRESS_TEST_BIN)
-	
+-include $(LIB_OBJ:.o=.d) $(OBJ)/src/main.d $(TEST_OBJ:.o=.d) $(OBJ)/tests/stress_test.d $(GTEST_OBJ:.o=.d)
